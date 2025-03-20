@@ -37,6 +37,9 @@
 #	DBX_SKIP_WORKDIR
 #	DBX_SUDO_PROGRAM
 
+set -x
+set -e
+
 # Ensure we have our env variables correctly set
 [ -z "${USER}" ] && USER="$(id -run)"
 [ -z "${HOME}" ] && HOME="$(getent passwd "${USER}" | cut -d':' -f6)"
@@ -362,7 +365,6 @@ fi
 #   headless: bool headless mode
 #   skip_workdir: bool skip workdir
 #   verbose: bool verbose
-#   unshare_groups
 #   distrobox_enter_path
 # Expected env variables:
 #   PATH
@@ -379,17 +381,8 @@ generate_enter_command()
 		--interactive"
 	result_command="${result_command}
 		--detach-keys="
-
-	# In case of initful systems or unshared groups, we don't enter directly
-	# as our user, but we instead enter as root, and then su $USER, in order
-	# to trigger a proper login
-	if [ "${unshare_groups:-0}" -eq 1 ]; then
-		result_command="${result_command}
+	result_command="${result_command}
 			--user=root"
-	else
-		result_command="${result_command}
-			--user=${USER}"
-	fi
 
 	# For some usage, like use in service, or launched by non-terminal
 	# eg. from desktop files, TTY can fail to instantiate, and fail to enter
@@ -402,23 +395,7 @@ generate_enter_command()
 			--tty"
 	fi
 
-	# Entering container using our user and workdir.
-	# Start container from working directory. Else default to home. Else do /.
-	# Since we are entering from host, drop at workdir through '/run/host'
-	# which represents host's root inside container. Any directory on host
-	# even if not explicitly mounted is bound to exist under /run/host.
-	# Since user $HOME is very likely present in container, enter there directly
-	# to avoid confusing the user about shifted paths.
-	# pass distrobox-enter path, it will be used in the distrobox-export tool.
-	if [ "${skip_workdir}" -eq 0 ]; then
-		workdir="${PWD:-${container_home:-"/"}}"
-		if [ -n "${workdir##*"${container_home}"*}" ]; then
-			workdir="/run/host${workdir}"
-		fi
-	else
-		# Skipping workdir we just enter $HOME of the container.
-		workdir="${container_home}"
-	fi
+	workdir="${container_home}"
 
 	result_command="${result_command}
 		--workdir=${workdir}"
@@ -540,12 +517,11 @@ generate_enter_command()
 
 container_home="${HOME}"
 container_path="${PATH}"
-unshare_groups=0
+
 # Now inspect the container we're working with.
 container_status="unknown"
 eval "$(${container_manager} inspect --type container --format \
 	'container_status={{.State.Status}};
-	unshare_groups={{ index .Config.Labels "distrobox.unshare_groups" }};
 	{{range .Config.Env}}{{if and (ge (len .) 5) (eq (slice . 0 5) "HOME=")}}container_home={{slice . 5 | printf "%q"}}{{end}}{{end}};
 	{{range .Config.Env}}{{if and (ge (len .) 5) (eq (slice . 0 5) "PATH=")}}container_path={{slice . 5 | printf "%q"}}{{end}}{{end}}' \
 	"${container_name}")"
@@ -677,11 +653,9 @@ fi
 #
 # 1 - handle absence of custom command, we will need to add a getent command to
 #     execute the right container's user's shell
-# 2 - in case of unshared groups (or initful) we need to trigger a proper login
-#     using `su`, so we will need to manipulate these arguments accorodingly
-# 3 - prepend our generated command
+# 2 - prepend our generated command
 #     to do this, we use `tac` so we reverse loop it and prepend each argument.
-# 4 - now that we're done, we can prepend our container_command
+# 3 - now that we're done, we can prepend our container_command
 #     we will need to use `rev` to reverse it as we reverse loop and prepend each
 #     argument
 ################################################################################
@@ -694,19 +668,14 @@ if [ "${container_custom_command}" -eq 0 ]; then
 	set - "$@" "/bin/sh" "-c" "\$(getent passwd '${container_command_user}' | cut -f 7 -d :) -l"
 fi
 
-# If we have a command and we're unsharing groups, we need to execute those
-# command using su $container_command_user
-# if we're in a tty, also allocate one
-if [ "${unshare_groups:-0}" -eq 1 ]; then
-	# shellcheck disable=SC2089,SC2016
-	set -- "-c" '"$0" "$@"' -- "$@"
-	set -- "-s" "/bin/sh" "$@"
-	if [ "${headless}" -eq 0 ]; then
-		set -- "--pty" "$@"
-	fi
-	set -- "${container_command_user}" "$@"
-	set -- "su" "$@"
+# shellcheck disable=SC2089,SC2016
+set -- "-c" '"$0" "$@"' -- "$@"
+set -- "-s" "/bin/sh" "$@"
+if [ "${headless}" -eq 0 ]; then
+	set -- "--pty" "$@"
 fi
+set -- "${container_command_user}" "$@"
+set -- "su" "$@"
 
 # Generate the exec command and run it
 cmd="$(generate_enter_command | awk '{a[i++]=$0} END {for (j=i-1; j>=0;) print a[j--]}')"

@@ -77,15 +77,16 @@ container_user_home="${HOME:-"/"}"
 container_user_name="${USER}"
 container_user_uid="$(id -ru)"
 dryrun=0
-init=0
 non_interactive=0
 nvidia=0
 nopasswd=0
-unshare_ipc=0
-unshare_groups=0
-unshare_netns=0
-unshare_process=0
-unshare_devsys=0
+mount_xauth=0
+mount_x11=0
+mount_gpus=0
+mount_wayland=0
+mount_pulseaudio=0
+mount_pipewire=0
+set_runtime_dir=0
 
 # Use cd + dirname + pwd so that we do not have relative paths in mount points
 # We're not using "realpath" here so that symlinks are not resolved this way
@@ -94,13 +95,13 @@ unshare_devsys=0
 distrobox_entrypoint_path="$(cd "$(dirname "${0}")" && pwd)/distrobox-init"
 distrobox_export_path="$(cd "$(dirname "${0}")" && pwd)/distrobox-export"
 distrobox_genentry_path="$(cd "$(dirname "${0}")" && pwd)/distrobox-generate-entry"
-distrobox_hostexec_path="$(cd "$(dirname "${0}")" && pwd)/distrobox-host-exec"
+
 # In case some of the scripts are not in the same path as create, let's search
 # in PATH for them.
 [ ! -e "${distrobox_entrypoint_path}" ] && distrobox_entrypoint_path="$(command -v distrobox-init)"
 [ ! -e "${distrobox_export_path}" ] && distrobox_export_path="$(command -v distrobox-export)"
 [ ! -e "${distrobox_genentry_path}" ] && distrobox_genentry_path="$(command -v distrobox-generate-entry)"
-[ ! -e "${distrobox_hostexec_path}" ] && distrobox_hostexec_path="$(command -v distrobox-host-exec)"
+
 # If the user runs this script as root in a login shell, set rootful=1.
 # There's no need for them to pass the --root flag option in such cases.
 [ "${container_user_uid}" -eq 0 ] && rootful=1 || rootful=0
@@ -182,7 +183,6 @@ Usage:
 	distrobox create --image alpine:latest --name test --init-hooks "touch /var/tmp/test1 && touch /var/tmp/test2"
 	distrobox create --image fedora:39 --name test --additional-flags "--env MY_VAR-value"
 	distrobox create --image fedora:39 --name test --volume /opt/my-dir:/usr/local/my-dir:rw --additional-flags "--pids-limit 100"
-	distrobox create -i docker.io/almalinux/8-init --init --name test --pre-init-hooks "dnf config-manager --enable powertools && dnf -y install epel-release"
 	distrobox create --clone fedora-39 --name fedora-39-copy
 	distrobox create --image alpine my-alpine-container
 	distrobox create --image registry.fedoraproject.org/fedora-toolbox:latest --name fedora-toolbox-latest
@@ -211,17 +211,16 @@ Options:
 	--additional-packages/-ap:	additional packages to install during initial container setup
 	--init-hooks:		additional commands to execute at the end of container initialization
 	--pre-init-hooks:	additional commands to execute at the start of container initialization
-	--init/-I:		use init system (like systemd) inside the container.
-				this will make host's processes not visible from within the container. (assumes --unshare-process)
+				this will make host's processes not visible from within the container
 				may require additional packages depending on the container image: https://github.com/89luca89/distrobox/blob/main/docs/useful_tips.md#using-init-system-inside-a-distrobox
 	--nvidia:		try to integrate host's nVidia drivers in the guest
 	--platform:		specify which platform to use, eg: linux/arm64
-	--unshare-devsys:          do not share host devices and sysfs dirs from host
-	--unshare-groups:          do not forward user's additional groups into the container
-	--unshare-ipc:          do not share ipc namespace with host
-	--unshare-netns:        do not share the net namespace with host
-	--unshare-process:          do not share process namespace with host
-	--unshare-all:          activate all the unshare flags below
+	--mount-xauth:		Mount the xauth file into the container
+	--mount-x11:		Mount the x11 socket into the container
+	--mount-gpus		Mount the dri devices into the container
+	--mount-wayland		Mount the wayland socket into the container
+	--mount-pulseaudio	Mount the pulseaudio socket into the container
+	--mount-pipewire	Mount the pipewire socket into the container
 	--compatibility/-C:	show list of compatible images
 	--help/-h:		show this message
 	--no-entry:		do not generate a container entry in the application list
@@ -307,40 +306,6 @@ while :; do
 		--absolutely-disable-root-password-i-am-really-positively-sure)
 			shift
 			nopasswd=1
-			;;
-		-I | --init)
-			shift
-			init=1
-			unshare_groups=1
-			unshare_process=1
-			;;
-		--unshare-ipc)
-			shift
-			unshare_ipc=1
-			;;
-		--unshare-groups)
-			shift
-			unshare_groups=1
-			;;
-		--unshare-netns)
-			shift
-			unshare_netns=1
-			;;
-		--unshare-process)
-			shift
-			unshare_process=1
-			;;
-		--unshare-devsys)
-			shift
-			unshare_devsys=1
-			;;
-		--unshare-all)
-			shift
-			unshare_devsys=1
-			unshare_groups=1
-			unshare_ipc=1
-			unshare_netns=1
-			unshare_process=1
 			;;
 		-C | --compatibility)
 			show_compatibility
@@ -436,6 +401,33 @@ while :; do
 				shift
 			fi
 			;;
+		--mount-xauth)
+			mount_xauth=1
+			shift
+			;;
+		--mount-x11)
+			mount_x11=1
+			shift
+			;;
+		--mount-gpus)
+			mount_gpus=1
+			shift
+			;;
+		--mount-wayland)
+			mount_wayland=1
+			set_runtime_dir=1
+			shift
+			;;
+		--mount-pulseaudio)
+			mount_pulseaudio=1
+			set_runtime_dir=1
+			shift
+			;;
+		--mount-pipewire)
+			mount_pipewire=1
+			set_runtime_dir=1
+			shift
+			;;
 		--) # End of all options.
 			shift
 			break
@@ -491,13 +483,11 @@ if [ -z "${container_name}" ]; then
 	container_name="$(basename "${container_image}" | sed -E 's/[:.]/-/g')"
 fi
 
+container_user_custom_home=${container_user_custom_home:-"$HOME/distrobox/${container_name}"}
+
 # set the container hostname to default value
 if [ -z "${container_hostname}" ]; then
-	container_hostname="$(uname -n)"
-
-	if [ "${unshare_netns}" -eq 1 ]; then
-		container_hostname="${container_name}.${container_hostname}"
-	fi
+	container_hostname="${container_name}.$(uname -n)"
 fi
 
 # check if container hostname is less than 64 chars to prevent issues
@@ -647,14 +637,8 @@ get_clone_image()
 #   container_user_gid: string user's GID
 #   container_home_prefix: string container's custom home prefix
 #   container_user_custom_home: string container's custom home path
-#   init: bool initful
 #   nvidia: bool nvidia integration
 #   rootful: bool rootful
-#   unshare_devsys: bool unshare devsys
-#   unshare_groups: bool unshare groups
-#   unshare_ipc: bool unshare ipc
-#   unshare_netns: bool unshare netns
-#   unshare_process: bool unshare proc
 # Expected env variables:
 #   None
 # Outputs:
@@ -668,26 +652,73 @@ generate_create_command()
 	result_command="${result_command}
 		--hostname \"${container_hostname}\"
 		--name \"${container_name}\"
-		--privileged
-		--security-opt label=disable
-		--security-opt apparmor=unconfined
 		--pids-limit=-1
 		--user root:root"
 
-	if [ "${unshare_ipc}" -eq 0 ]; then
+	if [ "${mount_xauth}" -eq 1 ]; then
+		if [[ -z "${XAUTHORITY}" ]]; then
+			printf >&2 "ERROR: \$XAUTHORITY variable is not set, but mounting it was requested\n"
+			exit 1
+		fi
 		result_command="${result_command}
-			--ipc host"
+			--volume $XAUTHORITY:/run/host/xauth
+			--env \"XAUTHORITY=/run/host/xauth\""
 	fi
 
-	if [ "${unshare_netns}" -eq 0 ]; then
+	if [ "${mount_x11}" -eq 1 ]; then
+		if [[ -z "${DISPLAY}" ]]; then
+			printf >&2 "ERROR: \$DISPLAY variable is not set, but mounting it was requested\n"
+			exit 1
+		fi
 		result_command="${result_command}
-			--network host"
+			--volume /tmp/.X11-unix/X$(echo "$DISPLAY" | sed 's/://g'):/tmp/.X11-unix/X$(echo "$DISPLAY" | sed 's/://g')
+			--env \"DISPLAY=$DISPLAY\""
 	fi
 
-	if [ "${unshare_process}" -eq 0 ]; then
+	if [ "${mount_gpus}" -eq 1 ]; then
+		if [ ! -d "/dev/dri" ]; then
+			printf >&2 "ERROR: folder /dev/dri does not exist, but mounting it was requested\n"
+			exit 1
+		fi
 		result_command="${result_command}
-			--pid host"
+			--volume /dev/dri:/dev/dri"
 	fi
+
+	if [ "${mount_wayland}" -eq 1 ]; then
+		if [[ -z "${WAYLAND_DISPLAY}" ]]; then
+			printf >&2 "ERROR: \$WAYLAND_DISPLAY variable is not set, but mounting it was requested\n"
+			exit 1
+		fi
+		result_command="${result_command}
+			--volume $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY:/run/host/run/$WAYLAND_DISPLAY
+			--env \"WAYLAND_DISPLAY=$WAYLAND_DISPLAY\""
+	fi
+
+	if [ "${mount_pulseaudio}" -eq 1 ]; then
+		if [ ! -d "${XDG_RUNTIME_DIR}/pulse" ]; then
+			printf >&2 "ERROR: pulseaudio directory at ${XDG_RUNTIME_DIR}/pulse not found, but mounting it was requested\n"
+			exit 1
+		fi
+		result_command="${result_command}
+			--volume $XDG_RUNTIME_DIR/pulse:/run/host/run/pulse"
+	fi
+
+	if [ "${mount_pipewire}" -eq 1 ]; then
+		if [ ! -S "${XDG_RUNTIME_DIR}/pipewire-0" ]; then
+			printf >&2 "ERROR: pipewire socket at ${XDG_RUNTIME_DIR}/pipewire-0 not found, but mounting it was requested\n"
+			exit 1
+		fi
+		result_command="${result_command}
+			--volume $XDG_RUNTIME_DIR/pipewire-0:/run/host/run/pipewire-0"
+	fi
+
+	if [ "${set_runtime_dir}" -eq 1 ]; then
+		if [[ -z "${XDG_RUNTIME_DIR}" ]]; then
+			printf >&2 "ERROR: \$XDG_RUNTIME_DIR variable is not set, but is required as a dependency\n"
+			exit 1
+		fi
+	fi
+
 	# Mount useful stuff inside the container.
 	# We also mount host's root filesystem to /run/host, to be able to syphon
 	# dynamic configurations from the host.
@@ -700,98 +731,12 @@ generate_create_command()
 	# utilities.
 	result_command="${result_command}
 		--label \"manager=distrobox\"
-		--label \"distrobox.unshare_groups=${unshare_groups}\"
 		--env \"SHELL=$(basename "${SHELL:-"/bin/bash"}")\"
 		--env \"HOME=${container_user_home}\"
 		--env \"container=${container_manager}\"
 		--env \"TERMINFO_DIRS=/usr/share/terminfo:/run/host/usr/share/terminfo\"
 		--env \"CONTAINER_ID=${container_name}\"
-		--volume /tmp:/tmp:rslave
-		--volume \"${distrobox_entrypoint_path}\":/usr/bin/entrypoint:ro
-		--volume \"${distrobox_export_path}\":/usr/bin/distrobox-export:ro
-		--volume \"${distrobox_hostexec_path}\":/usr/bin/distrobox-host-exec:ro
-		--volume \"${container_user_home}\":\"${container_user_home}\":rslave"
-
-	# Due to breaking change in https://github.com/opencontainers/runc/commit/d4b670fca6d0ac606777376440ffe49686ce15f4
-	# now we cannot mount /:/run/host as before, as it will try to mount RO partitions as RW thus breaking things.
-	# This will ensure we will mount directories one-by-one thus avoiding this problem.
-	#
-	# This happens ONLY with podman+runc, docker and lilipod are unaffected, so let's do this only if we have podman AND runc.
-	if echo "${container_manager}" | grep -q "podman" && ${container_manager} info | grep -q runc; then
-		for rootdir in /*; do
-
-			# Skip symlinks
-			if [ -L "${rootdir}" ]; then
-				continue
-			fi
-
-			# Find if the directory belongs to a RO mount, if do, mount it as RO+Rslave
-			if findmnt --notruncate --noheadings --list --output OPTIONS --target "${rootdir}" |
-				tr ',' '\n' | grep -q "^ro$"; then
-
-				result_command="${result_command}
-				--volume ${rootdir}:/run/host${rootdir}:ro,rslave"
-				continue
-			fi
-
-			# Else we mount it RW+Rslave
-			result_command="${result_command}
-				--volume ${rootdir}:/run/host${rootdir}:rslave"
-		done
-	else
-		# We're either on podman+crun, docker or lilipod, let's keep old behaviour
-		result_command="${result_command}
-			--volume /:/run/host/:rslave"
-
-	fi
-
-	if [ "${unshare_devsys}" -eq 0 ]; then
-		result_command="${result_command}
-			--volume /dev:/dev:rslave
-			--volume /sys:/sys:rslave"
-	fi
-
-	# In case of initful containers, we implement a series of mountpoint in order
-	# for systemd to work properly inside a container.
-	# The following are a flag-based implementation of what podman's --systemd flag
-	# does under the hood, as explained in their docs here:
-	#   https://docs.podman.io/en/latest/markdown/options/systemd.html
-	#
-	# set the default stop signal to SIGRTMIN+3.
-	# mount tmpfs file systems on the following directories
-	#	/run
-	#	/run/lock
-	#	/tmp
-	#	/var/lib/journal
-	#	/sys/fs/cgroup/systemd <- this one is done by cgroupns=host
-	if [ "${init}" -eq 1 ] && echo "${container_manager}" | grep -q "docker"; then
-		# In case of docker we're actually rootful, so we need to use hosts cgroups
-		result_command="${result_command}
-			--cgroupns host"
-	fi
-	if [ "${init}" -eq 1 ] && echo "${container_manager}" | grep -vq "podman"; then
-		# In case of all other non-podman container managers, we can do this
-		result_command="${result_command}
-			--stop-signal SIGRTMIN+3
-			--mount type=tmpfs,destination=/run
-			--mount type=tmpfs,destination=/run/lock
-			--mount type=tmpfs,destination=/var/lib/journal"
-	fi
-
-	# This fix is needed so that the container can have a separate devpts instance
-	# inside
-	# This will mount an empty /dev/pts, and the init will take care of mounting
-	# a new devpts with the proper flags set
-	# Mounting an empty volume there, is needed in order to ensure that no package
-	# manager tries to fiddle with /dev/pts/X that would not be writable by them
-	#
-	# This implementation is done this way in order to be compatible with both
-	# docker and podman
-	if [ "${unshare_devsys}" -eq 0 ]; then
-		result_command="${result_command}
-			--volume /dev/pts
-			--volume /dev/null:/dev/ptmx"
-	fi
+		--volume \"${distrobox_entrypoint_path}\":/usr/bin/entrypoint:ro"
 
 	# This fix is needed as on Selinux systems, the host's selinux sysfs directory
 	# will be mounted inside the rootless container.
@@ -820,35 +765,6 @@ generate_create_command()
 	result_command="${result_command}
 			--volume /var/log/journal"
 
-	# In some systems, for example using sysvinit, /dev/shm is a symlink
-	# to /run/shm, instead of the other way around.
-	# Resolve this detecting if /dev/shm is a symlink and mount original
-	# source also in the container.
-	if [ -L "/dev/shm" ] && [ "${unshare_ipc}" -eq 0 ]; then
-		result_command="${result_command}
-			--volume $(realpath /dev/shm):$(realpath /dev/shm)"
-	fi
-
-	# Ensure that both all container managers (not only podman) support forwarding of RedHat subscription-manager
-	# This is needed in order to have a working subscription forwarded into the container,
-	# this will ensure that rhel-9-for-x86_64-appstream-rpms and rhel-9-for-x86_64-baseos-rpms repos
-	# will be available in the container, so that distrobox-init will be able to
-	# install properly all the dependencies like mesa drivers.
-	#
-	# /run/secrets is a standard location for RHEL containers, that is being pointed by
-	# /etc/rhsm-host by default.
-	RHEL_SUBSCRIPTION_FILES="
-		/etc/pki/entitlement/:/run/secrets/etc-pki-entitlement:ro
-		/etc/rhsm/:/run/secrets/rhsm:ro
-		/etc/yum.repos.d/redhat.repo:/run/secrets/redhat.repo:ro
-	"
-	for rhel_file in ${RHEL_SUBSCRIPTION_FILES}; do
-		if [ -e "$(echo "${rhel_file}" | cut -d':' -f1)" ]; then
-			result_command="${result_command}
-				--volume ${rhel_file}"
-		fi
-	done
-
 	# If we have a home prefix to use, ano no custom home set, then we set
 	# the custom home to be PREFIX/CONTAINER_NAME
 	if [ -n "${container_home_prefix}" ] && [ -z "${container_user_custom_home}" ]; then
@@ -867,9 +783,8 @@ generate_create_command()
 			fi
 		fi
 		result_command="${result_command}
-			--env \"HOME=${container_user_custom_home}\"
-			--env \"DISTROBOX_HOST_HOME=${container_user_home}\"
-			--volume \"${container_user_custom_home}:${container_user_custom_home}:rslave\""
+			--env \"HOME=${container_user_home}\"
+			--volume \"${container_user_custom_home}:${container_user_home}:rslave\""
 	fi
 
 	# Mount also the /var/home dir on ostree based systems
@@ -881,53 +796,11 @@ generate_create_command()
 			--volume \"/var/home/${container_user_name}\":\"/var/home/${container_user_name}\":rslave"
 	fi
 
-	# Mount also the XDG_RUNTIME_DIR to ensure functionality of the apps.
-	# This is skipped in case of initful containers, so that a dedicated
-	# systemd user session can be used.
-	if [ -d "/run/user/${container_user_uid}" ] && [ "${init}" -eq 0 ]; then
-		result_command="${result_command}
-			--volume /run/user/${container_user_uid}:/run/user/${container_user_uid}:rslave"
-	fi
-
-	# These are dynamic configs needed by the container to function properly
-	# and integrate with the host
-	#
-	# We're doing this now instead of inside the init because some distros will
-	# have symlinks places for these files that use absolute paths instead of
-	# relative paths.
-	# This is the bare minimum to ensure connectivity inside the container.
-	# These files, will then be kept updated by the main loop every 15 seconds.
-	if [ "${unshare_netns}" -eq 0 ]; then
-		NET_FILES="
-			/etc/hosts
-			/etc/resolv.conf
-		"
-
-		# If container_hostname is custom, we skip mounting /etc/hostname, else
-		# we want to keep it in sync
-		if [ "${container_hostname}" = "$(uname -n)" ]; then
-			NET_FILES="${NET_FILES} /etc/hostname"
-		fi
-
-		for net_file in ${NET_FILES}; do
-			if [ -e "${net_file}" ]; then
-				result_command="${result_command}
-					--volume ${net_file}:${net_file}:ro"
-			fi
-		done
-	fi
-
 	# These flags are not supported by docker, so we use them only if our
 	# container manager is podman.
 	if echo "${container_manager}" | grep -q "podman"; then
 		result_command="${result_command}
-			--annotation run.oci.keep_original_groups=1
 			--ulimit host"
-
-		if [ "${init}" -eq 1 ]; then
-			result_command="${result_command}
-				--systemd=always"
-		fi
 
 		# Use keep-id only if going rootless.
 		if [ "${rootful}" -eq 0 ]; then
@@ -956,8 +829,7 @@ generate_create_command()
 		--name \"${container_user_name}\"
 		--user ${container_user_uid}
 		--group ${container_user_gid}
-		--home \"${container_user_custom_home:-"${container_user_home}"}\"
-		--init \"${init}\"
+		--home \"${container_user_home}\"
 		--nvidia \"${nvidia}\"
 		--pre-init-hooks \"${container_pre_init_hook}\"
 		--additional-packages \"${container_additional_packages}\"
